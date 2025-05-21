@@ -1,150 +1,128 @@
 import json
-from typing import Dict, Tuple
-
-from router import Router
 from packet import Packet
-
+from router import Router
 
 class DVrouter(Router):
-    """Distance‑Vector (RIP‑like) router node."""
+    def __init__(self, addr, heartbeat_time):
+        Router.__init__(self, addr)
+        self.heartbeat_time = heartbeat_time
+        self.last_time = 0
 
-    INF: int = 16
+        self.routing_table = {}
+        self.neighbors = {}
+        self.link_costs = {}
+        self.dv_from_neighbors = {}
+        self.last_sent = {}
 
-    def __init__(self, addr: str, heartbeat_time: int) -> None:  # Khởi tạo địa chỉ và thời gian heartbeat
-        super().__init__(addr)
-        self.heartbeat_time: int = heartbeat_time  # Chu kỳ gửi thông tin định tuyến
-        self.last_broadcast: int = 0  # Thời điểm gửi DV lần cuối
+        self.INFINITY = 16
 
-        # Địa chỉ hàng xóm → (cổng kết nối, chi phí liên kết)
-        self.neighbors: Dict[str, Tuple[int, int]] = {}
-        # Địa chỉ hàng xóm → Bảng định tuyến DV cuối cùng nhận được
-        self.neighbor_vectors: Dict[str, Dict[str, int]] = {}
-        # Bảng định tuyến DV hiện tại và bảng chuyển tiếp
-        self.dv: Dict[str, int] = {addr: 0}
-        self.forward: Dict[str, int] = {}
-
-    def _recompute_routes(self) -> bool:
-        """Một bước lặp Bellman–Ford. Trả về True nếu có thay đổi."""
-        INF = self.INF
-
-        new_dv: Dict[str, int] = {self.addr: 0}
-        new_fwd: Dict[str, int] = {}
-
-        # Tập hợp tất cả đích đến đã biết
-        dests = {self.addr}
-        dests.update(self.dv)
-        dests.update(self.neighbors)
-        for vec in self.neighbor_vectors.values():
-            dests.update(vec)
-
-        for dest in dests:
-            if dest == self.addr:
-                continue
-
-            best_cost = INF
-            best_port = None
-            for nbr, (port, link_cost) in self.neighbors.items():
-                nbr_vec = self.neighbor_vectors.get(nbr, {})
-                cost = link_cost + nbr_vec.get(dest, INF)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_port = port
-
-            if best_cost < INF:
-                new_dv[dest] = best_cost
-                new_fwd[dest] = best_port
-
-        changed = (new_dv != self.dv) or (new_fwd != self.forward)
-        if changed:
-            # Giới hạn chi phí tối đa trước khi lưu/gửi
-            self.dv = {d: min(c, INF) for d, c in new_dv.items()}
-            self.forward = new_fwd
-        return changed
-
-    def _send_vector_to_neighbor(self, nbr_addr: str, port: int) -> None:
-        """Gửi bản sao bảng DV (có thể bị 'đầu độc') đến 1 hàng xóm."""
-        INF = self.INF
-        vec = {
-            d: (INF if self.forward.get(d) == port and d != nbr_addr else c)
-            for d, c in self.dv.items()
-        }
-        pkt = Packet(Packet.ROUTING, self.addr, nbr_addr, content=json.dumps(vec))
-        self.send(port, pkt)
-
-    def _broadcast_vector(self) -> None:
-        """Gửi bảng DV đến tất cả các hàng xóm."""
-        for nbr, (port, _cost) in self.neighbors.items():
-            self._send_vector_to_neighbor(nbr, port)
-
-    def handle_packet(self, port: int, packet: Packet) -> None:
-        # Gói dữ liệu truy vết — chuyển tiếp nếu có đường đi
+    def handle_packet(self, port, packet):
         if packet.is_traceroute:
-            out_port = self.forward.get(packet.dst_addr)
-            if out_port is not None:
-                self.send(out_port, packet)
-            return  # bỏ qua nếu không có đường
-
-        # Gói định tuyến — cập nhật bảng vector của hàng xóm
-        try:
-            their_vector = json.loads(packet.content)
-        except json.JSONDecodeError:
-            return  # gói tin lỗi
-
-        # Lọc các giá trị chi phí không hợp lệ
-        for d, c in list(their_vector.items()):
-            if not isinstance(c, (int, float)) or c < 0 or c >= self.INF:
-                their_vector[d] = self.INF
-
-        nbr_addr = packet.src_addr
-        nbr_info = self.neighbors.get(nbr_addr)
-        if nbr_info is None or nbr_info[0] != port:
-            return  # bỏ qua nếu từ hàng xóm không hợp lệ
-
-        # Cập nhật nếu có sự thay đổi trong DV của hàng xóm
-        if self.neighbor_vectors.get(nbr_addr) != their_vector:
-            self.neighbor_vectors[nbr_addr] = their_vector
-            if self._recompute_routes():
-                self._broadcast_vector()
-
-    def handle_new_link(self, port: int, endpoint: str, cost: int) -> None:
-        """Khi một liên kết mới được thêm vào."""
-        self.neighbors[endpoint] = (port, cost)
-        self.neighbor_vectors.setdefault(endpoint, {endpoint: 0})
-
-        if self._recompute_routes():
-            self._broadcast_vector()
+            dst = packet.dst_addr
+            if dst in self.routing_table:
+                next_port = self.routing_table[dst][1]
+                self.send(next_port, packet)
+            return
         else:
-            self._send_vector_to_neighbor(endpoint, port)
+            neigh_addr = packet.src_addr
+            try:
+                neigh_vector = json.loads(packet.content)
+            except json.JSONDecodeError:
+                return
 
-    def handle_remove_link(self, port: int) -> None:
-        """Khi một liên kết hiện tại bị ngắt."""
-        removed_addr = None
-        for nbr, (p, _c) in list(self.neighbors.items()):
-            if p == port:
-                removed_addr = nbr
+            for d, c in list(neigh_vector.items()):
+                if not isinstance(c, (int, float)) or c < 0 or c >= self.INFINITY:
+                    neigh_vector[d] = self.INFINITY
+
+            if self.dv_from_neighbors.get(neigh_addr) != neigh_vector:
+                self.dv_from_neighbors[neigh_addr] = neigh_vector
+                self._recompute()
+
+    def handle_new_link(self, port, endpoint, cost):
+        self.neighbors[endpoint] = port
+        self.link_costs[endpoint] = cost
+        self.dv_from_neighbors.setdefault(endpoint, {endpoint: 0})
+        self._recompute()
+
+    def handle_remove_link(self, port):
+        neighbor = None
+        for nb, nb_port in self.neighbors.items():
+            if nb_port == port:
+                neighbor = nb
                 break
-        if removed_addr is None:
+
+        if neighbor is None:
             return
 
-        # Xoá trạng thái của hàng xóm bị ngắt
-        self.neighbors.pop(removed_addr, None)
-        self.neighbor_vectors.pop(removed_addr, None)
+        self.neighbors.pop(neighbor, None)
+        self.link_costs.pop(neighbor, None)
+        self.dv_from_neighbors.pop(neighbor, None)
 
-        # Xoá các đường đi phụ thuộc vào hàng xóm này
-        for dest in list(self.forward):
-            if self.forward[dest] == port:
-                self.dv.pop(dest, None)
-                self.forward.pop(dest, None)
+        for dest, (_, out_port) in list(self.routing_table.items()):
+            if out_port == port:
+                self.routing_table.pop(dest)
 
-        if self._recompute_routes():
-            self._broadcast_vector()
+        self._recompute()
 
-    def handle_time(self, time_ms: int) -> None:
-        """Hàm được gọi định kỳ để xử lý heartbeat."""
-        if time_ms >= self.last_broadcast + self.heartbeat_time:
-            self.last_broadcast = time_ms
-            self._broadcast_vector()
+    def handle_time(self, time_ms):
+        if time_ms - self.last_time >= self.heartbeat_time:
+            self.last_time = time_ms
+            self._broadcast()
 
-    def __repr__(self) -> str:
-        table = ", ".join(f"{d}:{c}" for d, c in sorted(self.dv.items()))
-        return f"DVrouter({self.addr}) dv=[{table}]"
+    def _broadcast(self):
+        for nb, nb_port in self.neighbors.items():
+            vec = {}
+            for dest in set(self.routing_table) | {self.addr}:
+                if dest == self.addr:
+                    vec[dest] = 0
+                elif self.routing_table.get(dest, (self.INFINITY, None))[1] == nb_port:
+                    vec[dest] = self.INFINITY  # Poisoned reverse
+                else:
+                    cost = self.routing_table.get(dest, (self.INFINITY,))[0]
+                    vec[dest] = min(cost, self.INFINITY)
+
+            if self.last_sent.get(nb) != vec:
+                pkt = Packet(Packet.ROUTING, self.addr, nb, content=json.dumps(vec))
+                self.send(nb_port, pkt)
+                self.last_sent[nb] = vec
+
+    def _recompute(self):
+        updated = False
+        new_table = {self.addr: (0, None)}
+
+        all_dests = {self.addr}
+        for vec in self.dv_from_neighbors.values():
+            all_dests.update(vec)
+        all_dests.update(self.routing_table)
+
+        for dest in all_dests:
+            if dest == self.addr:
+                continue
+            best_cost, best_port = self.INFINITY, None
+            for nb, nb_port in self.neighbors.items():
+                link_cost = self.link_costs.get(nb, self.INFINITY)
+                if dest == nb:
+                    cost = link_cost
+                else:
+                    neighbor_vec = self.dv_from_neighbors.get(nb, {})
+                    cost = link_cost + neighbor_vec.get(dest, self.INFINITY)
+                cost = min(cost, self.INFINITY)
+
+                if cost < best_cost:
+                    best_cost, best_port = cost, nb_port
+
+            if best_cost < self.INFINITY:
+                new_table[dest] = (best_cost, best_port)
+
+        if new_table != self.routing_table:
+            self.routing_table = new_table
+            updated = True
+
+        if updated:
+            self._broadcast()
+
+    def __repr__(self):
+        """Representation for debugging in the network visualizer."""
+        # TODO
+        #   NOTE This method is for your own convenience and will not be graded
+        return f"DVrouter(addr={self.addr})"
